@@ -1,0 +1,16 @@
+# личное
+local.md
+TASKS.md
+
+# рабочие папки тем: скачанные статьи — чужие тексты, в репозиторий не кладём
+istoki/
+sources/
+audio/
+*.pdf
+*.mp3
+*.wav
+
+# python
+__pycache__/
+*.pyc
+.venv/
