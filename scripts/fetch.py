@@ -8,10 +8,14 @@
 Результат: sources/<ключ>.md (текст с метками [стр. N]), sources/pdf/<ключ>.pdf, sources/index.json.
 Нет PDF — файл с аннотацией и статусом «только аннотация».
 Готовый .md не перезаписывается: на его строки уже могут ссылаться выписки. --force — только если выписок ещё нет.
+
+Статус источника — метаданные в index.json; файл .md при смене статуса не меняется.
+    python fetch.py --dir <папка> --confirm KEY            # «ПРОВЕРИТЬ» → подтверждён после проверки глазами
+    python fetch.py --dir <папка> --reject KEY --reason "…" # не та работа / негодный текст → отклонён
+Каждая смена статуса пишется в index.json → history. Тезисы на отклонённый источник не удаляются:
+check_claims.py перестаёт их пропускать и называет причину.
 """
 import argparse, difflib, pathlib, re, sys, time
-
-import fitz  # PyMuPDF
 
 from common import get, load, save, works_by_ids, source_key, today, log
 from check_claims import canon, sha
@@ -22,6 +26,8 @@ ap.add_argument("--ids", nargs="*", default=[])
 ap.add_argument("--top", type=int, default=0)
 ap.add_argument("--force", action="store_true")
 ap.add_argument("--confirm", nargs="+", metavar="KEY", help="подтвердить источник со статусом ПРОВЕРИТЬ после проверки глазами")
+ap.add_argument("--reject", nargs="+", metavar="KEY", help="отклонить источник (нужна --reason)")
+ap.add_argument("--reason", help="причина для --reject / --confirm")
 a = ap.parse_args()
 
 d = pathlib.Path(a.dir)
@@ -29,18 +35,37 @@ src = d / "sources"
 (src / "pdf").mkdir(parents=True, exist_ok=True)
 index = load(src / "index.json", {})
 
-if a.confirm:
-    for key in a.confirm:
-        meta, md = index.get(key), src / f"{key}.md"
-        if not meta or not md.exists() or "ПРОВЕРИТЬ" not in meta["status"]:
-            print(f"{key}: нечего подтверждать")
+
+def set_status(key, new, reason):
+    meta = index[key]
+    meta.setdefault("history", []).append({"date": today(), "from": meta["status"], "to": new, "reason": reason or ""})
+    meta["status"] = new
+
+
+cited = {}   # источник → тезисы, которые на него ссылаются
+for sec in (load(d / "claims.json", {}) or {}).get("sections", []):
+    for c in sec.get("claims", []):
+        for e in c.get("evidence") or []:
+            cited.setdefault(e.get("source"), set()).add(c.get("id"))
+
+if a.confirm or a.reject:
+    if a.reject and not (a.reason or "").strip():
+        sys.exit("для --reject нужна --reason")
+    uses = cited
+    for key in a.confirm or []:
+        if key not in index or not index[key]["status"].startswith("полный текст, ПРОВЕРИТЬ"):
+            print(f"{key}: нечего подтверждать (статус не «ПРОВЕРИТЬ»)")
             continue
-        meta["status"] = "полный текст (подтверждено вручную)"
-        text = md.read_text(encoding="utf-8").splitlines()
-        text = [f"- Статус: {meta['status']}; подтверждено {today()}" if ln.startswith("- Статус:") else ln for ln in text]
-        md.write_text("\n".join(text) + "\n", encoding="utf-8")   # число строк не меняется
-        meta["sha256"] = sha(md)
+        set_status(key, "полный текст (подтверждено вручную)", a.reason)
         print(f"{key}: подтверждён")
+    for key in a.reject or []:
+        if key not in index:
+            print(f"{key}: нет в index.json")
+            continue
+        set_status(key, f"отклонён: {a.reason}", a.reason)
+        tied = sorted(uses.get(key, []))
+        print(f"{key}: отклонён" + (f"; на него ссылаются тезисы {', '.join(tied)} — "
+                                     "check_claims.py их не пропустит, исправь или исключи (review.py --exclude)" if tied else ""))
     save(src / "index.json", index)
     sys.exit(0)
 
@@ -120,6 +145,12 @@ for i in dict.fromkeys(ids):
     if md.exists() and not a.force:
         log(f"{key}: уже есть")
         continue
+    if index.get(key, {}).get("status", "").startswith("отклонён"):
+        log(f"{key}: отклонён ({index[key]['status']}) — не перекачиваю")
+        continue
+    if md.exists() and key in cited:
+        log(f"{key}: на него ссылаются тезисы {', '.join(sorted(cited[key]))} — --force не перекачивает")
+        continue
     log(f"{key}: ищу текст…")
     url, pdf = download(pdf_candidates(item))
     lines, status = [], ""
@@ -127,6 +158,7 @@ for i in dict.fromkeys(ids):
     if pdf:
         (src / "pdf" / f"{key}.pdf").write_bytes(pdf)
         try:
+            import fitz  # PyMuPDF; здесь, чтобы --confirm/--reject работали без него
             doc = fitz.open(stream=pdf, filetype="pdf")
             pages = [[ln.rstrip() for ln in page.get_text("text").splitlines() if ln.strip()] for page in doc]
         except Exception as e:
@@ -145,7 +177,7 @@ for i in dict.fromkeys(ids):
             status = "PDF без текстового слоя (скан) — цитировать нельзя"
         elif found < 0.6:
             status = (f"полный текст, ПРОВЕРИТЬ: название совпало на {found:.0%}. Открой файл; если работа та — "
-                      f"fetch.py --confirm {key}, если нет — удали файл и запись")
+                      f"fetch.py --confirm {key}, если нет — fetch.py --reject {key} --reason \"…\"")
         else:
             status = f"полный текст (PDF, {len(pages)} стр.)"
     elif pdf:
@@ -160,7 +192,8 @@ for i in dict.fromkeys(ids):
     index[key] = {"id": item["id"], "title": item["title"], "authors": item.get("authors") or [],
                   "year": item.get("year"), "venue": item.get("venue"), "doi": item.get("doi"),
                   "url": url, "license": item.get("license"), "status": status, "via": item.get("via"),
-                  "lines": len(header(item, key, status, url)) + len(lines), "sha256": sha(md)}
+                  "lines": len(header(item, key, status, url)) + len(lines), "sha256": sha(md),
+                  "history": index.get(key, {}).get("history", [])}
     save(src / "index.json", index)
     print(f"{key}: {status}")
     time.sleep(1)

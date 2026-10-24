@@ -28,7 +28,11 @@ a = ap.parse_args()
 d = pathlib.Path(a.dir)
 claims, _, _ = verify(d)
 by_id = {c["id"]: c for s in claims.get("sections", []) for c in s.get("claims", [])}
-blocks, speech, errors = parse((d / a.script).read_text(encoding="utf-8"), by_id, a.engine)
+valid = {i: None if c.get("admitted") else "тезис не допущен в основной слой: " + "; ".join(c.get("not_admitted") or [])
+         for i, c in by_id.items()}
+for it in (claims.get("synthesis") or []) + (claims.get("proposals") or []):
+    valid[it["id"]] = None if it.get("ok") else "; ".join(it.get("errors") or [])
+blocks, speech, errors = parse((d / a.script).read_text(encoding="utf-8"), valid, a.engine)
 if errors:
     print("Сценарий не прошёл проверку:")
     print("\n".join("  " + e for e in errors))
@@ -95,7 +99,13 @@ else:
 
 
 # ---------- транскрипт ----------
+layers = {it["id"]: it for it in (claims.get("synthesis") or []) + (claims.get("proposals") or [])}
+
+
 def ref_md(r):
+    if r in layers:   # синтез или предложение — показываем опоры
+        kind = "синтез" if r.startswith("s") else "предложение ИИ"
+        return f"{r} ({kind}, опора: {', '.join(layers[r]['basis'])})"
     ev = by_id[r]["evidence"]
     return f"{r}: " + "; ".join(f"[{e['source']}.md:{e['line']}](../sources/{e['source']}.md)" for e in ev)
 

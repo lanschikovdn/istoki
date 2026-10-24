@@ -1,7 +1,11 @@
 """Разбор и проверка сценария аудиовыпуска (используется speak.py; без torch)."""
 import re
 
-REF = re.compile(r"\[(c\d+)\]")
+REF = re.compile(r"\[([csp]\d+)\]")
+# синтез и предложения звучат только в своих блоках, чтобы не смешаться с фактами;
+# блок предложений — «Предложения ИИ» или «Наши предложения», не «…авторов»
+LAYER_HEADER = {"s": re.compile(r"синтез|сопоставлен", re.I),
+                "p": re.compile(r"^(наши предложения|предложения ии)\b", re.I)}
 ANY_REF = re.compile(r"\[[^\]]*\]")
 # после перевода чисел Silero должен получить только кириллицу и знаки препинания
 SILERO_OK = re.compile(r"[а-яёА-ЯЁ\s.,!?:;()«»\"'—–\-]")
@@ -36,28 +40,34 @@ def say_numbers(t):
     return t
 
 
-def parse(text, claims_by_id, engine):
-    """Возвращает (blocks, speech, errors). blocks: (is_header, text, refs)."""
-    blocks, errors = [], []
+def parse(text, valid, engine):
+    """Возвращает (blocks, speech, errors). blocks: (is_header, text, refs).
+
+    valid: id → None, если на него можно ссылаться (допущенный тезис, верный синтез или
+    предложение), иначе строка с причиной."""
+    blocks, errors, header = [], [], ""
     for n, raw in enumerate(text.splitlines(), 1):
         s = raw.strip()
         if not s:
             continue
         if s.startswith("#"):
-            blocks.append((True, s.lstrip("# ").strip(), []))
+            header = s.lstrip("# ").strip()
+            blocks.append((True, header, []))
             continue
         refs = REF.findall(s)
         other = [r for r in ANY_REF.findall(s) if not REF.fullmatch(r)]
         if other:
-            errors.append(f"строка {n}: ссылки только на тезисы вида [c4], а не {', '.join(other)}")
+            errors.append(f"строка {n}: ссылки только вида [c4], [s1], [p1], а не {', '.join(other)}")
         if not refs:
             errors.append(f"строка {n}: нет ссылки на тезис — «{s[:60]}»")
         for r in refs:
-            c = claims_by_id.get(r)
-            if not c:
-                errors.append(f"строка {n}: тезиса {r} нет в claims.json")
-            elif not c.get("ok"):
-                errors.append(f"строка {n}: тезис {r} не прошёл проверку")
+            if r not in valid:
+                errors.append(f"строка {n}: {r} нет в claims.json")
+            elif valid[r]:
+                errors.append(f"строка {n}: на {r} ссылаться нельзя — {valid[r]}")
+            if r[0] in LAYER_HEADER and (not LAYER_HEADER[r[0]].search(header) or "автор" in header.lower()):
+                need = "«Синтез»" if r[0] == "s" else "«Предложения ИИ» или «Наши предложения»"
+                errors.append(f"строка {n}: {r} звучит только в блоке с заголовком {need}, а не «{header}»")
         blocks.append((False, " ".join(ANY_REF.sub("", s).split()), refs))
 
     if engine != "silero":
